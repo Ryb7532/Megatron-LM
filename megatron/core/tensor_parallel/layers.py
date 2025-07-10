@@ -238,6 +238,8 @@ class VocabParallelEmbedding(torch.nn.Module):
             if config.perform_initialization:
                 _initialize_affine_weight_gpu(self.weight, init_method, partition_dim=0, stride=1)
 
+        self.registered_next_weight = None
+
     def forward(self, input_):
         """Forward.
 
@@ -265,7 +267,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         if self.reduce_scatter_embeddings:
             # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
             output_parallel = output_parallel.transpose(0, 1).contiguous()
-            output = reduce_scatter_to_sequence_parallel_region(output_parallel)
+            output = reduce_scatter_to_sequence_parallel_region(output_parallel, weight=self.registered_next_weight)
         else:
             # Reduce across all the model parallel GPUs.
             output = reduce_from_tensor_model_parallel_region(output_parallel)
@@ -289,6 +291,18 @@ class VocabParallelEmbedding(torch.nn.Module):
                 prepend_offsets=sharded_offsets,
             )
         }
+
+    def register_next_module(self, next_module):
+        assert self.reduce_scatter_embeddings, \
+            "To utilize AG-wgrad overlap, this module must call `reduce_scatter_to_sequence_parallel_region`."
+        assert isinstance(next_module, RowParallelLinear), \
+            "Module to be registered for AG-wgrad overlap must be RowParallelLinear Module."
+        assert next_module.weight.requires_grad, \
+            "Module to be registered for AG-wgrad overlap must have a trainable weight."
+
+        setattr(next_module.weight, "wgrad_fn", None)
+        self.registered_next_weight = next_module.weight
+        next_module.use_wgrad_stash = True
 
 
 class LinearWithFrozenWeight(torch.autograd.Function):
@@ -669,6 +683,126 @@ def linear_with_grad_accumulation_and_async_allreduce(
 
 
 linear_with_grad_accumulation_and_async_allreduce.warned = False
+
+
+class LinearWithWgradStash(torch.autograd.Function):
+    """See linear_with_wgrad_stash"""
+
+    @staticmethod
+    @custom_fwd
+    def forward(
+        ctx,
+        input,
+        weight,
+        gradient_accumulation_fusion,
+    ):
+        """Forward."""
+        ctx.save_for_backward(input, weight)
+        ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
+
+        output = torch.matmul(input, weight.t())
+        return output
+
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, grad_output):
+        """Backward."""
+        input, weight = ctx.saved_tensors
+
+        grad_input = grad_output.matmul(weight)
+
+        grad_output, input = prepare_input_tensors_for_wgrad_compute(
+            grad_output, input
+        )
+
+        def wgrad_fn():
+            if ctx.gradient_accumulation_fusion:
+                if weight.main_grad.dtype == torch.float32:
+                    fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
+                        input, grad_output, weight.main_grad
+                    )
+                elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
+                    fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
+                        input, grad_output, weight.main_grad
+                    )
+                else:
+                    raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
+
+                if hasattr(weight, 'grad_added_to_main_grad'):
+                    # When overlap_grad_reduce is True, need to ensure that backward hooks
+                    # are all run on the main backprop thread to prevent deadlocks. Setup
+                    # dummy grad_weight tensor to prevent backward hooks from being run
+                    # in a background thread.
+                    if getattr(weight, 'zero_out_wgrad', False):
+                        grad_weight = torch.zeros(
+                            weight.main_grad.shape,
+                            dtype=input.dtype,
+                            device=torch.cuda.current_device(),
+                            requires_grad=False,
+                        )
+                    else:
+                        grad_weight = torch.empty(
+                            weight.main_grad.shape,
+                            dtype=input.dtype,
+                            device=torch.cuda.current_device(),
+                            requires_grad=False,
+                        )
+                    weight.grad_added_to_main_grad = True
+                else:
+                    grad_weight = None
+            else:
+                grad_weight = grad_output.t().matmul(input)
+
+            return grad_weight
+
+        weight.wgrad_fn = wgrad_fn
+
+        return grad_input, None, None
+
+
+def linear_with_wgrad_stash(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    gradient_accumulation_fusion: bool,
+    allreduce_dgrad: bool,
+    sequence_parallel: bool,
+    grad_output_buffer: Optional[List[torch.Tensor]] = None,
+    wgrad_deferral_limit: Optional[int] = 0,
+    async_grad_allreduce: Optional[bool] = None,
+) -> torch.Tensor:
+    """Linear layer execution with weight gradient computation stash.
+    This function is only for RowParallelLinear.
+
+    Args:
+        input (torch.Tensor required): input like torch.nn.functional.linear
+
+        weight (torch.Tensor required): weight like torch.nn.functional.linear
+
+        gradient_accumulation_fusion (bool required): Perform the gradient
+            accumulation fusion, requires the custom CUDA extension
+            fused_weight_gradient_mlp_cuda module. To use
+            gradient_accumulation_fusion you must install APEX with
+            --cpp_ext and --cuda_ext. For example: "pip install
+            --global-option=\"--cpp_ext\" --global-option=\"--cuda_ext .\"
+            " Note that the extension requires CUDA>=11. Otherwise, you
+            must turn off gradient accumulation fusion."
+    """
+
+    if not linear_with_wgrad_stash.warned:
+        if bias is not None or allreduce_dgrad or sequence_parallel or \
+            grad_output_buffer is not None:
+                warnings.warn(
+                    "The function `linear_with_wgrad_stash` is only for "
+                    "RowParallelLinear module. "
+                    "If you use this function elsewhere, "
+                    "the calculation results may be incorrect."
+                )
+                linear_with_wgrad_stash.warned = True
+
+    return LinearWithWgradStash.apply(input, weight, gradient_accumulation_fusion)
+
+linear_with_wgrad_stash.warned = False
 
 
 class ColumnParallelLinear(torch.nn.Module):
@@ -1144,6 +1278,9 @@ class RowParallelLinear(torch.nn.Module):
             )
         )
 
+        self.use_wgrad_stash = False
+        self.registered_next_weight = None
+
     def forward(self, input_):
         """Forward of RowParallelLinear
 
@@ -1170,6 +1307,8 @@ class RowParallelLinear(torch.nn.Module):
         # Matrix multiply.
         if not self.weight.requires_grad:
             self._forward_impl = linear_with_frozen_weight
+        elif self.use_wgrad_stash:
+            self._forward_impl = linear_with_wgrad_stash
         else:
             self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
 
@@ -1190,7 +1329,7 @@ class RowParallelLinear(torch.nn.Module):
             assert self.skip_bias_add
             output_ = output_parallel
         elif self.sequence_parallel:
-            output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
+            output_ = reduce_scatter_to_sequence_parallel_region(output_parallel, weight=self.registered_next_weight)
         else:
             output_ = reduce_from_tensor_model_parallel_region(output_parallel)
         if not self.skip_bias_add:
@@ -1222,3 +1361,15 @@ class RowParallelLinear(torch.nn.Module):
             f"{type(self).__name__}(in_features={self.input_size}, "
             f"out_features={self.output_size}, bias={use_bias}, TP={tp})"
         )
+
+    def register_next_module(self, next_module):
+        assert not self.explicit_expert_comm and self.sequence_parallel, \
+            "To utilize AG-wgrad overlap, this module must call `reduce_scatter_to_sequence_parallel_region`."
+        assert isinstance(next_module, RowParallelLinear), \
+            "Module to be registered for AG-wgrad overlap must be RowParallelLinear Module."
+        assert next_module.weight.requires_grad, \
+            "Module to be registered for AG-wgrad overlap must have a trainable weight."
+
+        setattr(next_module.weight, "wgrad_fn", None)
+        self.registered_next_weight = next_module.weight
+        next_module.use_wgrad_stash = True

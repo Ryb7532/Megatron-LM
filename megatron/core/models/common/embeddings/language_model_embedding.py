@@ -8,6 +8,7 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.tensor_parallel import RowParallelLinear
 
 
 class LanguageModelEmbedding(MegatronModule):
@@ -81,6 +82,8 @@ class LanguageModelEmbedding(MegatronModule):
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(self.config.hidden_dropout)
 
+        self.registered_next_weight = None
+
     def zero_parameters(self):
         """Zero out all parameters in embedding."""
         self.word_embeddings.weight.data.fill_(0)
@@ -129,7 +132,7 @@ class LanguageModelEmbedding(MegatronModule):
         # Dropout.
         if self.config.sequence_parallel:
             if not self.reduce_scatter_embeddings and self.scatter_to_sequence_parallel:
-                embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
+                embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings, weight=self.registered_next_weight)
             # `scatter_to_sequence_parallel_region` returns a view, which prevents
             # the original tensor from being garbage collected. Clone to facilitate GC.
             # Has a small runtime cost (~0.5%).
@@ -141,3 +144,18 @@ class LanguageModelEmbedding(MegatronModule):
             embeddings = self.embedding_dropout(embeddings)
 
         return embeddings
+
+    def register_next_module(self, next_module):
+        assert self.config.sequence_parallel and self.scatter_to_sequence_parallel, \
+            "To utilize AG-wgrad overlap, this module must call `scatter_to_sequence_parallel_region`."
+        assert isinstance(next_module, RowParallelLinear), \
+            "Module to be registered for AG-wgrad overlap must be RowParallelLinear Module."
+        assert next_module.weight.requires_grad, \
+            "Module to be registered for AG-wgrad overlap must have a trainable weight."
+
+        if self.reduce_scatter_embeddings:
+            self.word_embeddings.register_next_module(next_module)
+        else:
+            setattr(next_module.weight, "wgrad_fn", None)
+            self.registered_next_weight = next_module.weight
+            next_module.use_wgrad_stash = True

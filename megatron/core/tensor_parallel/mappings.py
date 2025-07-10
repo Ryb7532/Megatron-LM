@@ -198,6 +198,48 @@ def _reduce_scatter_along_first_dim(
     return output
 
 
+def _gather_along_first_dim_async(input_, group=None, output_split_sizes=None, use_global_buffer=False):
+    """Gather tensors and concatenate along the first dimension.
+
+    Args:
+        input_tensor (torch.Tensor):
+            A tensor to be gathered.
+        output_split_sizes (List[int], optional):
+            A list specifying the sizes of the output splits along the first dimension.
+            If None, equal splitting is assumed. Default: None.
+
+    Returns:
+        torch.Tensor: Gathered tensor.
+    """
+
+    if group is None:
+        group = get_tensor_model_parallel_group()
+    world_size = torch.distributed.get_world_size(group)
+    # Bypass the function if we are using only 1 GPU.
+    if world_size == 1:
+        return input_, None
+
+    dim_size = list(input_.size())
+    if output_split_sizes is None:
+        dim_size[0] = dim_size[0] * world_size
+
+        if use_global_buffer:
+            output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
+        else:
+            output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
+        handle = dist_all_gather_func(output, input_.contiguous(), group=group, async_op=True)
+    else:
+        dim_size[0] = sum(output_split_sizes)
+        if use_global_buffer:
+            output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
+        else:
+            output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
+        output_tensor_list = list(torch.split(output, output_split_sizes, dim=0))
+        handle = torch.distributed.all_gather(output_tensor_list, input_, group=group, async_op=True)
+
+    return output, handle
+
+
 class _CopyToModelParallelRegion(torch.autograd.Function):
     """Pass the input to the model parallel region."""
 
@@ -459,6 +501,73 @@ class _AllToAll(torch.autograd.Function):
         )
 
 
+class _ScatterToSequenceParallelRegionWithWgradOverlap(torch.autograd.Function):
+    """Split the input and keep only the corresponding chuck to the rank."""
+
+    @staticmethod
+    def symbolic(graph, input_, weight):
+        """Symbolic function for tracing."""
+        return _split_along_first_dim(input_)
+
+    @staticmethod
+    def forward(ctx, input_, weight):
+        """Forward function."""
+        ctx.weight = weight
+        return _split_along_first_dim(input_)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward function."""
+        weight = ctx.weight
+
+        grad_input, handle = _gather_along_first_dim_async(grad_output)
+        # _ = torch.empty(1, device=grad_output.device) + 1 # delay starting wgrad
+        grad_weight = weight.wgrad_fn() # if weight.wgrad_fn is not None else None
+        weight.wgrad_fn = None
+        if handle is not None:
+            handle.wait()
+        return (grad_input, grad_weight)
+
+
+class _ReduceScatterToSequenceParallelRegionWithWgradOverlap(torch.autograd.Function):
+    """Reduce scatter the input from the model parallel region. In backward, """
+
+    @staticmethod
+    def symbolic(graph, input_, weight, group=None, input_split_sizes=None, use_global_buffer=False):
+        """Symbolic function for tracing."""
+        return _reduce_scatter_along_first_dim(input_, group, input_split_sizes, use_global_buffer)
+
+    @staticmethod
+    def forward(ctx, input_, weight, group=None, input_split_sizes=None, use_global_buffer=False):
+        """Forward function."""
+        ctx.group = group
+        ctx.input_split_sizes = input_split_sizes
+        ctx.use_global_buffer = use_global_buffer
+        ctx.weight = weight
+        return _reduce_scatter_along_first_dim(input_, group, input_split_sizes, use_global_buffer)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward function."""
+        input_split_sizes = ctx.input_split_sizes
+        use_global_buffer = ctx.use_global_buffer
+        weight = ctx.weight
+
+        grad_input, handle = _gather_along_first_dim_async(grad_output, ctx.group, input_split_sizes, use_global_buffer)
+        # _ = torch.empty(1, device=grad_output.device) + 1 # delay starting wgrad
+        grad_weight = weight.wgrad_fn() # if weight.wgrad_fn is not None else None
+        weight.wgrad_fn = None
+        if handle is not None:
+            handle.wait()
+        return (
+            grad_input,
+            grad_weight,
+            None,
+            None,
+            None,
+        )
+
+
 # -----------------
 # Helper functions.
 # -----------------
@@ -484,8 +593,10 @@ def gather_from_tensor_model_parallel_region(input_):
     return _GatherFromModelParallelRegion.apply(input_)
 
 
-def scatter_to_sequence_parallel_region(input_):
+def scatter_to_sequence_parallel_region(input_, weight=None):
     """Wrapper for autograd function: forward: split, backward: AG <last dim>"""
+    if weight is not None:
+        return _ScatterToSequenceParallelRegionWithWgradOverlap.apply(input_, weight)
     return _ScatterToSequenceParallelRegion.apply(input_)
 
 
@@ -503,9 +614,13 @@ def gather_from_sequence_parallel_region(
 
 
 def reduce_scatter_to_sequence_parallel_region(
-    input_, group=None, input_split_sizes=None, use_global_buffer=False
+    input_, group=None, input_split_sizes=None, use_global_buffer=False, weight=None
 ):
     """Wrapper for autograd function: forward: RS, backward AG <fisrt dim>"""
+    if weight is not None:
+        return _ReduceScatterToSequenceParallelRegionWithWgradOverlap.apply(
+            input_, weight, group, input_split_sizes, use_global_buffer
+        )
     return _ReduceScatterToSequenceParallelRegion.apply(
         input_, group, input_split_sizes, use_global_buffer
     )
