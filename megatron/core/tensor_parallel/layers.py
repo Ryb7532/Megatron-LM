@@ -302,7 +302,12 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         setattr(next_module.weight, "wgrad_fn", None)
         self.registered_next_weight = next_module.weight
-        next_module.use_wgrad_stash = True
+
+    def delete_registered_next_module(self):
+        if hasattr(self.registered_next_weight, "wgrad_fn"):
+            delattr(self.registered_next_weight, "wgrad_fn")
+
+        self.registered_next_weight = None
 
 
 class LinearWithFrozenWeight(torch.autograd.Function):
@@ -1278,7 +1283,6 @@ class RowParallelLinear(torch.nn.Module):
             )
         )
 
-        self.use_wgrad_stash = False
         self.registered_next_weight = None
 
     def forward(self, input_):
@@ -1307,7 +1311,7 @@ class RowParallelLinear(torch.nn.Module):
         # Matrix multiply.
         if not self.weight.requires_grad:
             self._forward_impl = linear_with_frozen_weight
-        elif self.use_wgrad_stash:
+        elif hasattr(self.weight, "wgrad_fn"):
             self._forward_impl = linear_with_wgrad_stash
         else:
             self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
@@ -1372,4 +1376,9 @@ class RowParallelLinear(torch.nn.Module):
 
         setattr(next_module.weight, "wgrad_fn", None)
         self.registered_next_weight = next_module.weight
-        next_module.use_wgrad_stash = True
+
+    def delete_registered_next_module(self):
+        if hasattr(self.registered_next_weight, "wgrad_fn"):
+            delattr(self.registered_next_weight, "wgrad_fn")
+
+        self.registered_next_weight = None

@@ -158,4 +158,12 @@ class LanguageModelEmbedding(MegatronModule):
         else:
             setattr(next_module.weight, "wgrad_fn", None)
             self.registered_next_weight = next_module.weight
-            next_module.use_wgrad_stash = True
+
+    def delete_registered_next_module(self):
+        if self.reduce_scatter_embeddings:
+            self.word_embeddings.delete_registered_next_module()
+        else:
+            if hasattr(self.registered_next_weight, "wgrad_fn"):
+                delattr(self.registered_next_weight, "wgrad_fn")
+
+            self.registered_next_weight = None
