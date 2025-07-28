@@ -36,6 +36,7 @@ from .mappings import (
 )
 from .random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from .utils import VocabUtility, divide
+from megatron.core.extensions.transformer_engine import TERowParallelLinearWithAGWgradOverlap
 
 _grad_accum_fusion_available = True
 try:
@@ -239,6 +240,7 @@ class VocabParallelEmbedding(torch.nn.Module):
                 _initialize_affine_weight_gpu(self.weight, init_method, partition_dim=0, stride=1)
 
         self.registered_next_weight = None
+        self.registered_backward_dw = None
 
     def forward(self, input_):
         """Forward.
@@ -268,6 +270,8 @@ class VocabParallelEmbedding(torch.nn.Module):
             # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
             output_parallel = output_parallel.transpose(0, 1).contiguous()
             output = reduce_scatter_to_sequence_parallel_region(output_parallel, weight=self.registered_next_weight)
+            if self.registered_next_weight is not None and self.registered_backward_dw is not None:
+                self.registered_next_weight.wgrad_fn = self.registered_backward_dw
         else:
             # Reduce across all the model parallel GPUs.
             output = reduce_from_tensor_model_parallel_region(output_parallel)
@@ -295,19 +299,22 @@ class VocabParallelEmbedding(torch.nn.Module):
     def register_next_module(self, next_module):
         assert self.reduce_scatter_embeddings, \
             "To utilize AG-wgrad overlap, this module must call `reduce_scatter_to_sequence_parallel_region`."
-        assert isinstance(next_module, RowParallelLinear), \
+        assert isinstance(next_module, (RowParallelLinear, TERowParallelLinearWithAGWgradOverlap)), \
             "Module to be registered for AG-wgrad overlap must be RowParallelLinear Module."
         assert next_module.weight.requires_grad, \
             "Module to be registered for AG-wgrad overlap must have a trainable weight."
 
         setattr(next_module.weight, "wgrad_fn", None)
         self.registered_next_weight = next_module.weight
+        if isinstance(next_module, TERowParallelLinearWithAGWgradOverlap):
+            self.registered_backward_dw = next_module.backward_dw
 
     def delete_registered_next_module(self):
         if hasattr(self.registered_next_weight, "wgrad_fn"):
             delattr(self.registered_next_weight, "wgrad_fn")
 
         self.registered_next_weight = None
+        self.registered_backward_dw = None
 
 
 class LinearWithFrozenWeight(torch.autograd.Function):
@@ -760,6 +767,7 @@ class LinearWithWgradStash(torch.autograd.Function):
 
             return grad_weight
 
+        assert weight.wgrad_fn is None
         weight.wgrad_fn = wgrad_fn
 
         return grad_input, None, None

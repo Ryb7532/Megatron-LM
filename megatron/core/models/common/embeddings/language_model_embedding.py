@@ -9,6 +9,7 @@ from megatron.core import tensor_parallel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.tensor_parallel import RowParallelLinear
+from megatron.core.extensions.transformer_engine import TERowParallelLinearWithAGWgradOverlap
 
 
 class LanguageModelEmbedding(MegatronModule):
@@ -83,6 +84,7 @@ class LanguageModelEmbedding(MegatronModule):
         self.embedding_dropout = torch.nn.Dropout(self.config.hidden_dropout)
 
         self.registered_next_weight = None
+        self.registered_backward_dw = None
 
     def zero_parameters(self):
         """Zero out all parameters in embedding."""
@@ -133,6 +135,8 @@ class LanguageModelEmbedding(MegatronModule):
         if self.config.sequence_parallel:
             if not self.reduce_scatter_embeddings and self.scatter_to_sequence_parallel:
                 embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings, weight=self.registered_next_weight)
+                if self.registered_next_weight is not None and self.registered_backward_dw is not None:
+                    self.registered_next_weight.wgrad_fn = self.registered_backward_dw
             # `scatter_to_sequence_parallel_region` returns a view, which prevents
             # the original tensor from being garbage collected. Clone to facilitate GC.
             # Has a small runtime cost (~0.5%).
@@ -148,7 +152,7 @@ class LanguageModelEmbedding(MegatronModule):
     def register_next_module(self, next_module):
         assert self.config.sequence_parallel and self.scatter_to_sequence_parallel, \
             "To utilize AG-wgrad overlap, this module must call `scatter_to_sequence_parallel_region`."
-        assert isinstance(next_module, RowParallelLinear), \
+        assert isinstance(next_module, (RowParallelLinear, TERowParallelLinearWithAGWgradOverlap)), \
             "Module to be registered for AG-wgrad overlap must be RowParallelLinear Module."
         assert next_module.weight.requires_grad, \
             "Module to be registered for AG-wgrad overlap must have a trainable weight."
@@ -158,6 +162,8 @@ class LanguageModelEmbedding(MegatronModule):
         else:
             setattr(next_module.weight, "wgrad_fn", None)
             self.registered_next_weight = next_module.weight
+            if isinstance(next_module, TERowParallelLinearWithAGWgradOverlap):
+                self.registered_backward_dw = next_module.backward_dw
 
     def delete_registered_next_module(self):
         if self.reduce_scatter_embeddings:
@@ -167,3 +173,4 @@ class LanguageModelEmbedding(MegatronModule):
                 delattr(self.registered_next_weight, "wgrad_fn")
 
             self.registered_next_weight = None
+            self.registered_backward_dw = None
