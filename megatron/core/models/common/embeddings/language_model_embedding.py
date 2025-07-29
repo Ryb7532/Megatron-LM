@@ -162,8 +162,7 @@ class LanguageModelEmbedding(MegatronModule):
         else:
             setattr(next_module.weight, "wgrad_fn", None)
             self.registered_next_weight = next_module.weight
-            if isinstance(next_module, TERowParallelLinearWithAGWgradOverlap):
-                self.registered_backward_dw = next_module.backward_dw
+            self.registered_backward_dw = getattr(next_module, "backward_dw", None)
 
     def delete_registered_next_module(self):
         if self.reduce_scatter_embeddings:

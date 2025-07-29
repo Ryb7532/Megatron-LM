@@ -36,7 +36,6 @@ from .mappings import (
 )
 from .random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from .utils import VocabUtility, divide
-from megatron.core.extensions.transformer_engine import TERowParallelLinearWithAGWgradOverlap
 
 _grad_accum_fusion_available = True
 try:
@@ -299,15 +298,12 @@ class VocabParallelEmbedding(torch.nn.Module):
     def register_next_module(self, next_module):
         assert self.reduce_scatter_embeddings, \
             "To utilize AG-wgrad overlap, this module must call `reduce_scatter_to_sequence_parallel_region`."
-        assert isinstance(next_module, (RowParallelLinear, TERowParallelLinearWithAGWgradOverlap)), \
-            "Module to be registered for AG-wgrad overlap must be RowParallelLinear Module."
         assert next_module.weight.requires_grad, \
             "Module to be registered for AG-wgrad overlap must have a trainable weight."
 
         setattr(next_module.weight, "wgrad_fn", None)
         self.registered_next_weight = next_module.weight
-        if isinstance(next_module, TERowParallelLinearWithAGWgradOverlap):
-            self.registered_backward_dw = next_module.backward_dw
+        self.registered_backward_dw = getattr(next_module, "backward_dw", None)
 
     def delete_registered_next_module(self):
         if hasattr(self.registered_next_weight, "wgrad_fn"):
