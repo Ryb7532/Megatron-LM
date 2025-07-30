@@ -126,6 +126,8 @@ class TELinear(te.pytorch.Linear):
         skip_weight_param_allocation: bool,
         tp_comm_buffer_name: Optional[str] = None,
         is_expert: bool = False,
+        disable_comm_overlap_ag: bool = False,
+        disable_comm_overlap_rs: bool = False,
     ):
         self.config = config
 
@@ -158,6 +160,10 @@ class TELinear(te.pytorch.Linear):
                         if hasattr(self.config, "tp_comm_overlap_rs")
                         else self.config.tp_comm_split_rs or self.config.tp_comm_atomic_rs
                     )
+                    if disable_comm_overlap_ag:
+                        extra_kwargs["ub_overlap_ag"] = False
+                    if disable_comm_overlap_rs:
+                        extra_kwargs["ub_overlap_rs"] = False
                     # Disable ub overlap for experts.
                     if is_expert:
                         extra_kwargs["ub_overlap_ag"] = False
@@ -457,6 +463,8 @@ class TEColumnParallelLinear(TELinear):
         is_expert: bool,
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
+        disable_comm_overlap_ag: bool = False,
+        disable_comm_overlap_rs: bool = False,
     ):
         if gather_output:
             raise ValueError('Transformer Engine linear layers do not support gather_output = True')
@@ -476,6 +484,8 @@ class TEColumnParallelLinear(TELinear):
             is_expert=is_expert,
             skip_weight_param_allocation=skip_weight_param_allocation,
             tp_comm_buffer_name=tp_comm_buffer_name,
+            disable_comm_overlap_ag=disable_comm_overlap_ag,
+            disable_comm_overlap_rs=disable_comm_overlap_rs,
         )
 
         if config.use_cpu_initialization:
@@ -540,6 +550,8 @@ class TERowParallelLinear(TELinear):
         skip_bias_add: bool,
         is_expert: bool,
         tp_comm_buffer_name: Optional[str] = None,
+        disable_comm_overlap_ag: bool = False,
+        disable_comm_overlap_rs: bool = False,
     ):
         if not input_is_parallel:
             raise ValueError(
@@ -561,6 +573,8 @@ class TERowParallelLinear(TELinear):
             skip_weight_param_allocation=False,  # We don't currently use this for row parallel layers # pylint: disable=line-too-long
             is_expert=is_expert,
             tp_comm_buffer_name=tp_comm_buffer_name,
+            disable_comm_overlap_ag=disable_comm_overlap_ag,
+            disable_comm_overlap_rs=disable_comm_overlap_rs,
         )
         if config.use_cpu_initialization:
             if is_expert:
@@ -624,6 +638,8 @@ class TERowParallelLinearWithAGWgradOverlap(te.pytorch.LinearWithAGWgradOverlap)
         skip_bias_add: bool,
         is_expert: bool,
         tp_comm_buffer_name: Optional[str] = None,
+        disable_comm_overlap_ag: bool = False,
+        disable_comm_overlap_rs: bool = False,
     ):
         if not input_is_parallel:
             raise ValueError(
@@ -654,6 +670,10 @@ class TERowParallelLinearWithAGWgradOverlap(te.pytorch.LinearWithAGWgradOverlap)
                         if hasattr(self.config, "tp_comm_overlap_rs")
                         else self.config.tp_comm_split_rs or self.config.tp_comm_atomic_rs
                     )
+                    if disable_comm_overlap_ag:
+                        extra_kwargs["ub_overlap_ag"] = False
+                    if disable_comm_overlap_rs:
+                        extra_kwargs["ub_overlap_rs"] = False
                     # Disable ub overlap for experts.
                     if is_expert:
                         extra_kwargs["ub_overlap_ag"] = False
