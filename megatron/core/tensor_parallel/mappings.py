@@ -689,3 +689,90 @@ def all_to_all_hp2sp(input_):
     )
     output = torch.cat(split_tensors, dim=-1)
     return output
+
+def pipelined_all_gather_and_matmul0(input_, weight, transpose_weight=False, num_chunks=1):
+    """
+    All gather the input from sequence parallel region and do matmul in a pipelined way.
+    Args:
+        input_ (torch.Tensor):
+            An input tensor to be gathered. [sequence/TP, batch, input_hidden]
+        weight (torch.Tensor):
+            A weight tensor. [input_hidden, output_hidden] or [output_hidden, input_hidden]
+        transpose_weight (bool):
+            Whether to transpose the weight before matmul.
+    Returns:
+        torch.Tensor: The output tensor. [sequence, batch, output_hidden]
+    """
+    world_size = get_tensor_model_parallel_world_size()
+    if transpose_weight:
+        weight = weight.t()
+
+    if world_size == 1 or num_chunks == 1:
+        return torch.matmul(input_, weight)
+
+    assert input_.dim() == 3
+    assert weight.dim() == 2
+    assert input_.shape[-1] == weight.shape[0]
+    assert input_.shape[0] % num_chunks == 0
+    batch = input_.shape[1]
+    output_hidden = weight.shape[1]
+
+    input_chunks = torch.chunk(input_, num_chunks, dim=0) # [num_chunks, sequence/TP/num_chunks, batch, input_hidden]
+    output_chunks = []
+    all_gather_split_sizes = [input_chunks[0].shape[0]] * world_size
+    for input_split in input_chunks:
+        input_gathered, handle = _gather_along_first_dim_async(input_split, output_split_sizes=all_gather_split_sizes, use_global_buffer=True) # [TP, sequence/TP/num_chunks, batch, input_hidden]
+        if handle is not None:
+            handle.wait()
+        output_split = torch.matmul(input_gathered, weight) # [TP, sequence/TP/num_chunks, batch, output_hidden]
+        output_chunks.append(output_split)
+    output = torch.stack(output_chunks) # [num_chunks, TP, sequence/TP/num_chunks, batch, output_hidden]
+    # [num_chunks, TP, sequence/TP/num_chunks, batch, output_hidden] -> [TP, num_chunks, sequence/TP/num_chunks, batch, output_hidden]
+    output = output.permute(1, 0, 2, 3, 4)
+    # [TP, num_chunks, sequence/TP/num_chunks, batch, output_hidden] -> [sequence, batch, output_hidden]
+    output = output.reshape(-1, batch, output_hidden)
+
+    return output
+
+def pipelined_all_gather_and_matmul1(input_, weight, transpose_weight=False, num_chunks=1):
+    """
+    All gather the input from sequence parallel region and do matmul in a pipelined way.
+    Args:
+        input_ (torch.Tensor):
+            An input tensor to be gathered. [sequence/TP, batch, input_hidden]
+        weight (torch.Tensor):
+            A weight tensor. [input_hidden, output_hidden] or [output_hidden, input_hidden]
+        transpose_weight (bool):
+            Whether to transpose the weight before matmul.
+    Returns:
+        torch.Tensor: The output tensor. [sequence, batch, output_hidden]
+    """
+    world_size = get_tensor_model_parallel_world_size()
+    if transpose_weight:
+        weight = weight.t()
+
+    if world_size == 1 or num_chunks == 1:
+        return torch.matmul(input_, weight)
+
+
+    assert input_.dim() == 3
+    assert weight.dim() == 2
+    assert input_.shape[-1] == weight.shape[0]
+    sequence = input_.shape[0] * world_size
+    batch = input_.shape[1]
+    output_hidden = weight.shape[1]
+
+    input_flat = input_.reshape(-1, input_.shape[-1]) # [sequence/TP * batch, input_hidden]
+    input_chunks = torch.chunk(input_flat, num_chunks, dim=-1) # [num_chunks, sequence/TP * batch, input_hidden/num_chunks]
+    weight_chunks = torch.chunk(weight, num_chunks, dim=0) # [num_chunks, input_hidden/num_chunks, output_hidden]
+    output_flat = torch.zeros(sequence * batch, output_hidden, dtype=input_.dtype, device=input_.device) # [sequence * batch, output_hidden]
+    for i in range(num_chunks):
+        input_gathered, handle = _gather_along_first_dim_async(input_chunks[i], use_global_buffer=True) # [sequence * batch, input_hidden/num_chunks]
+        if handle is not None:
+            handle.wait()
+        # output_split = torch.matmul(input_gathered, weight_chunks[i]) # [sequence * batch, output_hidden]
+        # output_flat += output_split
+        torch.addmm(output_flat, input_gathered, weight_chunks[i], out=output_flat)
+    output = output_flat.reshape(sequence, batch, output_hidden) # [sequence, batch, output_hidden]
+
+    return output
