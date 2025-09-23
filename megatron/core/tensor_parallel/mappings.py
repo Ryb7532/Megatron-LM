@@ -784,7 +784,7 @@ def pipelined_all_gather_and_matmul1(input_, weight, transpose_weight=False, num
                 handle.wait()
             # output_split = torch.matmul(input_gathered, weight_chunks[i]) # [sequence * batch, output_hidden]
             # output_flat += output_split
-            torch.addmm(output_flat, input_gathered, weight_chunks[i], out=output_flat)
+            torch.addmm(output_flat, input_gathered, weight_chunks[i-1], out=output_flat)
     output = output_flat.reshape(sequence, batch, output_hidden) # [sequence, batch, output_hidden]
 
     return output
