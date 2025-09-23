@@ -1,6 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import torch
+from collections import deque
 
 from megatron.core.parallel_state import (
     get_global_memory_buffer,
@@ -719,14 +720,20 @@ def pipelined_all_gather_and_matmul0(input_, weight, transpose_weight=False, num
 
     input_chunks = torch.chunk(input_, num_chunks, dim=0) # [num_chunks, sequence/TP/num_chunks, batch, input_hidden]
     output_chunks = []
-    all_gather_split_sizes = [input_chunks[0].shape[0]] * world_size
-    for input_split in input_chunks:
-        input_gathered, handle = _gather_along_first_dim_async(input_split, output_split_sizes=all_gather_split_sizes, use_global_buffer=True) # [TP, sequence/TP/num_chunks, batch, input_hidden]
-        if handle is not None:
-            handle.wait()
-        output_split = torch.matmul(input_gathered, weight) # [TP, sequence/TP/num_chunks, batch, output_hidden]
-        output_chunks.append(output_split)
-    output = torch.stack(output_chunks) # [num_chunks, TP, sequence/TP/num_chunks, batch, output_hidden]
+    pipeline_queue = deque([], 2)
+    for i in range(num_chunks + 1):
+        if i < num_chunks:
+            comm = _gather_along_first_dim_async(input_chunks[i], use_global_buffer=True) # [sequence/num_chunks, batch, input_hidden]
+            pipeline_queue.append(comm)
+        if i > 0:
+            input_gathered, handle = pipeline_queue.popleft()
+            if handle is not None:
+                handle.wait()
+            output_split = torch.matmul(input_gathered, weight) # [sequence/num_chunks, batch, output_hidden]
+            output_chunks.append(output_split)
+    output = torch.stack(output_chunks) # [num_chunks, sequence/num_chunks, batch, output_hidden]
+    # [num_chunks, sequence/num_chunks, batch, output_hidden] -> [num_chunks, TP, sequence/TP/num_chunks, batch, output_hidden]
+    output = output.reshape(num_chunks, world_size, -1, batch, output_hidden)
     # [num_chunks, TP, sequence/TP/num_chunks, batch, output_hidden] -> [TP, num_chunks, sequence/TP/num_chunks, batch, output_hidden]
     output = output.permute(1, 0, 2, 3, 4)
     # [TP, num_chunks, sequence/TP/num_chunks, batch, output_hidden] -> [sequence, batch, output_hidden]
@@ -766,13 +773,18 @@ def pipelined_all_gather_and_matmul1(input_, weight, transpose_weight=False, num
     input_chunks = torch.chunk(input_flat, num_chunks, dim=-1) # [num_chunks, sequence/TP * batch, input_hidden/num_chunks]
     weight_chunks = torch.chunk(weight, num_chunks, dim=0) # [num_chunks, input_hidden/num_chunks, output_hidden]
     output_flat = torch.zeros(sequence * batch, output_hidden, dtype=input_.dtype, device=input_.device) # [sequence * batch, output_hidden]
-    for i in range(num_chunks):
-        input_gathered, handle = _gather_along_first_dim_async(input_chunks[i], use_global_buffer=True) # [sequence * batch, input_hidden/num_chunks]
-        if handle is not None:
-            handle.wait()
-        # output_split = torch.matmul(input_gathered, weight_chunks[i]) # [sequence * batch, output_hidden]
-        # output_flat += output_split
-        torch.addmm(output_flat, input_gathered, weight_chunks[i], out=output_flat)
+    pipeline_queue = deque([], 2)
+    for i in range(num_chunks + 1):
+        if i < num_chunks:
+            comm = _gather_along_first_dim_async(input_chunks[i], use_global_buffer=True) # [sequence * batch, input_hidden/num_chunks]
+            pipeline_queue.append(comm)
+        if i > 0:
+            input_gathered, handle = pipeline_queue.popleft()
+            if handle is not None:
+                handle.wait()
+            # output_split = torch.matmul(input_gathered, weight_chunks[i]) # [sequence * batch, output_hidden]
+            # output_flat += output_split
+            torch.addmm(output_flat, input_gathered, weight_chunks[i], out=output_flat)
     output = output_flat.reshape(sequence, batch, output_hidden) # [sequence, batch, output_hidden]
 
     return output
