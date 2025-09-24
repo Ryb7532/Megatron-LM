@@ -715,11 +715,13 @@ def pipelined_all_gather_and_matmul0(input_, weight, transpose_weight=False, num
     assert weight.dim() == 2
     assert input_.shape[-1] == weight.shape[0]
     assert input_.shape[0] % num_chunks == 0
+    sequence = input_.shape[0] * world_size
     batch = input_.shape[1]
     output_hidden = weight.shape[1]
 
     input_chunks = torch.chunk(input_, num_chunks, dim=0) # [num_chunks, sequence/TP/num_chunks, batch, input_hidden]
-    output_chunks = []
+    output = torch.empty(sequence, batch, output_hidden, dtype=input_.dtype, device=input_.device) # [sequence, batch, output_hidden]
+    output_chunks = torch.chunk(output, num_chunks, dim=0) # [num_chunks, sequence/num_chunks, batch, output_hidden]
     pipeline_queue = deque([], 2)
     for i in range(num_chunks + 1):
         if i < num_chunks:
@@ -729,9 +731,7 @@ def pipelined_all_gather_and_matmul0(input_, weight, transpose_weight=False, num
             input_gathered, handle = pipeline_queue.popleft()
             if handle is not None:
                 handle.wait()
-            output_split = torch.matmul(input_gathered, weight) # [sequence/num_chunks, batch, output_hidden]
-            output_chunks.append(output_split)
-    output = torch.stack(output_chunks) # [num_chunks, sequence/num_chunks, batch, output_hidden]
+            torch.matmul(input_gathered, weight, out=output_chunks[i-1])
     # [num_chunks, sequence/num_chunks, batch, output_hidden] -> [num_chunks, TP, sequence/TP/num_chunks, batch, output_hidden]
     output = output.reshape(num_chunks, world_size, -1, batch, output_hidden)
     # [num_chunks, TP, sequence/TP/num_chunks, batch, output_hidden] -> [TP, num_chunks, sequence/TP/num_chunks, batch, output_hidden]
