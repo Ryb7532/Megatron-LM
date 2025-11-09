@@ -505,45 +505,48 @@ class _ScatterToSequenceParallelRegionWithWgradOverlap(torch.autograd.Function):
     """Split the input and keep only the corresponding chuck to the rank."""
 
     @staticmethod
-    def symbolic(graph, input_, weight):
+    def symbolic(graph, input_, weight, wgrad_fn=None):
         """Symbolic function for tracing."""
         return _split_along_first_dim(input_)
 
     @staticmethod
-    def forward(ctx, input_, weight):
+    def forward(ctx, input_, weight, wgrad_fn=None):
         """Forward function."""
         ctx.weight = weight
+        ctx._wgrad_fn = wgrad_fn
         return _split_along_first_dim(input_)
 
     @staticmethod
     def backward(ctx, grad_output):
         """Backward function."""
         weight = ctx.weight
+        wgrad_fn = ctx._wgrad_fn or weight.wgrad_fn
 
         grad_input, handle = _gather_along_first_dim_async(grad_output)
         # _ = torch.empty(1, device=grad_output.device) + 1 # delay starting wgrad
-        grad_weight = weight.wgrad_fn() # if weight.wgrad_fn is not None else None
+        grad_weight = wgrad_fn() # if wgrad_fn is not None else None
         weight.wgrad_fn = None
         if handle is not None:
             handle.wait()
-        return (grad_input, grad_weight)
+        return (grad_input, grad_weight, None)
 
 
 class _ReduceScatterToSequenceParallelRegionWithWgradOverlap(torch.autograd.Function):
     """Reduce scatter the input from the model parallel region. In backward, """
 
     @staticmethod
-    def symbolic(graph, input_, weight, group=None, input_split_sizes=None, use_global_buffer=False):
+    def symbolic(graph, input_, weight, wgrad_fn=None, group=None, input_split_sizes=None, use_global_buffer=False):
         """Symbolic function for tracing."""
         return _reduce_scatter_along_first_dim(input_, group, input_split_sizes, use_global_buffer)
 
     @staticmethod
-    def forward(ctx, input_, weight, group=None, input_split_sizes=None, use_global_buffer=False):
+    def forward(ctx, input_, weight, wgrad_fn=None, group=None, input_split_sizes=None, use_global_buffer=False):
         """Forward function."""
         ctx.group = group
         ctx.input_split_sizes = input_split_sizes
         ctx.use_global_buffer = use_global_buffer
         ctx.weight = weight
+        ctx._wgrad_fn = wgrad_fn
         return _reduce_scatter_along_first_dim(input_, group, input_split_sizes, use_global_buffer)
 
     @staticmethod
@@ -552,16 +555,18 @@ class _ReduceScatterToSequenceParallelRegionWithWgradOverlap(torch.autograd.Func
         input_split_sizes = ctx.input_split_sizes
         use_global_buffer = ctx.use_global_buffer
         weight = ctx.weight
+        wgrad_fn = ctx._wgrad_fn or weight.wgrad_fn
 
         grad_input, handle = _gather_along_first_dim_async(grad_output, ctx.group, input_split_sizes, use_global_buffer)
         # _ = torch.empty(1, device=grad_output.device) + 1 # delay starting wgrad
-        grad_weight = weight.wgrad_fn() # if weight.wgrad_fn is not None else None
+        grad_weight = wgrad_fn() # if wgrad_fn is not None else None
         weight.wgrad_fn = None
         if handle is not None:
             handle.wait()
         return (
             grad_input,
             grad_weight,
+            None,
             None,
             None,
             None,
@@ -593,10 +598,10 @@ def gather_from_tensor_model_parallel_region(input_):
     return _GatherFromModelParallelRegion.apply(input_)
 
 
-def scatter_to_sequence_parallel_region(input_, weight=None):
+def scatter_to_sequence_parallel_region(input_, weight=None, wgrad_fn=None):
     """Wrapper for autograd function: forward: split, backward: AG <last dim>"""
     if weight is not None:
-        return _ScatterToSequenceParallelRegionWithWgradOverlap.apply(input_, weight)
+        return _ScatterToSequenceParallelRegionWithWgradOverlap.apply(input_, weight, wgrad_fn)
     return _ScatterToSequenceParallelRegion.apply(input_)
 
 
@@ -614,12 +619,12 @@ def gather_from_sequence_parallel_region(
 
 
 def reduce_scatter_to_sequence_parallel_region(
-    input_, group=None, input_split_sizes=None, use_global_buffer=False, weight=None
+    input_, group=None, input_split_sizes=None, use_global_buffer=False, weight=None, wgrad_fn=None
 ):
     """Wrapper for autograd function: forward: RS, backward AG <fisrt dim>"""
     if weight is not None:
         return _ReduceScatterToSequenceParallelRegionWithWgradOverlap.apply(
-            input_, weight, group, input_split_sizes, use_global_buffer
+            input_, weight, wgrad_fn, group, input_split_sizes, use_global_buffer
         )
     return _ReduceScatterToSequenceParallelRegion.apply(
         input_, group, input_split_sizes, use_global_buffer

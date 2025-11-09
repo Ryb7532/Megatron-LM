@@ -268,9 +268,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         if self.reduce_scatter_embeddings:
             # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
             output_parallel = output_parallel.transpose(0, 1).contiguous()
-            output = reduce_scatter_to_sequence_parallel_region(output_parallel, weight=self.registered_next_weight)
-            if self.registered_next_weight is not None and self.registered_backward_dw is not None:
-                self.registered_next_weight.wgrad_fn = self.registered_backward_dw
+            output = reduce_scatter_to_sequence_parallel_region(output_parallel, weight=self.registered_next_weight, wgrad_fn=self.registered_backward_dw)
         else:
             # Reduce across all the model parallel GPUs.
             output = reduce_from_tensor_model_parallel_region(output_parallel)

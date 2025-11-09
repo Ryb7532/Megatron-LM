@@ -134,9 +134,7 @@ class LanguageModelEmbedding(MegatronModule):
         # Dropout.
         if self.config.sequence_parallel:
             if not self.reduce_scatter_embeddings and self.scatter_to_sequence_parallel:
-                embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings, weight=self.registered_next_weight)
-                if self.registered_next_weight is not None and self.registered_backward_dw is not None:
-                    self.registered_next_weight.wgrad_fn = self.registered_backward_dw
+                embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings, weight=self.registered_next_weight, wgrad_fn=self.registered_backward_dw)
             # `scatter_to_sequence_parallel_region` returns a view, which prevents
             # the original tensor from being garbage collected. Clone to facilitate GC.
             # Has a small runtime cost (~0.5%).
